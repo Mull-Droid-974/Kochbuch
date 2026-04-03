@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init:*)",
+      "Bash(git remote:*)",
+      "Bash(git config:*)",
+      "Bash(npm --version)",
+      "Bash(cmd.exe /c \"node --version\")",
+      "Bash(powershell.exe -Command \"node --version\")",
+      "Bash(cmd.exe /c \"node --version && npm --version\")",
+      "Bash(cmd.exe /c \"where node 2>&1\")",
+      "Bash(cmd.exe /c \"winget list nodejs\")",
+      "Bash(powershell.exe -Command \"node --version; npm --version; exit 0\")",
+      "Bash(powershell.exe -Command \"node --version; npm --version\")",
+      "Bash(export PATH=\"/c/Program Files/nodejs:$PATH\")",
+      "Bash(rm README.md)",
+      "Bash(npx create-next-app@latest . --typescript --tailwind --app --no-src-dir --import-alias \"@/*\" --no-eslint --yes)",
+      "Bash(npm install:*)",
+      "Bash(npx shadcn@latest init --defaults)"
+    ]
+  }
+}
