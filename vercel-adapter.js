@@ -1,8 +1,6 @@
 // Vercel deployment adapter for Next.js 16
-// Uses Vercel Build Output API v3 with per-route serverless functions.
-// Each output (appPage / appRoute) becomes its own .func directory,
-// which means we NEVER need the full NextNodeServer – we invoke the
-// compiled per-route handler directly as the adapter API specifies.
+// Vercel Build Output API v3 – single catch-all Node.js function.
+// Routes are matched inside the function itself (no NextNodeServer needed).
 
 'use strict'
 const fs   = require('fs')
@@ -26,13 +24,8 @@ function copyDir(src, dest) {
   }
 }
 
-/**
- * Read an NTF trace file and add all referenced absolute paths to the set.
- * Returns a Map<relToProject, absPath>.
- */
-function readNtf(nftPath, projectDir) {
-  const map = new Map()
-  if (!fs.existsSync(nftPath)) return map
+function readNtf(nftPath, projectDir, map) {
+  if (!fs.existsSync(nftPath)) return
   const { files } = JSON.parse(fs.readFileSync(nftPath, 'utf8'))
   const dir = path.dirname(nftPath)
   for (const f of files) {
@@ -40,32 +33,15 @@ function readNtf(nftPath, projectDir) {
     const rel = path.relative(projectDir, abs)
     if (!rel.startsWith('..') && fs.existsSync(abs)) map.set(rel, abs)
   }
-  return map
 }
 
-/**
- * Convert a Next.js pathname like /cookbooks/[id] to a Vercel source regex.
- * Also returns the function name (safe for directory names).
- */
-function pathnameToFunc(pathname) {
-  // Build a safe function dir name
-  let name = pathname
-    .replace(/^\//, '')              // strip leading /
-    .replace(/\[\.\.\.(.+?)\]/g, '_$1_catchall')  // [...slug] → _slug_catchall
-    .replace(/\[(.+?)\]/g, '_$1_')  // [id] → _id_
-    .replace(/\//g, '--')            // / → --
-    || 'index'
-
-  // Build the Vercel route source regex
-  let src = pathname
-    .replace(/\[\.\.\.(.+?)\]/g, '(.+)')    // [...slug] → (.+)
-    .replace(/\[(.+?)\]/g, '([^/]+)')       // [id] → ([^/]+)
-    // escape dots, no other special chars expected in pathname
+// Convert a Next.js pathname (/cookbooks/[id]) to a JS regex string
+function pathnameToRegex(pathname) {
+  const esc = pathname
+    .replace(/\[\.\.\.(.+?)\]/g, '(.+)')
+    .replace(/\[(.+?)\]/g, '([^/]+)')
     .replace(/\./g, '\\.')
-
-  src = `^${src}$`
-
-  return { name, src }
+  return `^${esc}(?:\\?.*)?$`
 }
 
 // ── adapter ──────────────────────────────────────────────────────────────────
@@ -75,149 +51,149 @@ const adapter = {
   name: 'vercel-standalone',
 
   async onBuildComplete({ distDir, projectDir, outputs }) {
-    console.log('[vercel-adapter] Building .vercel/output/ ...')
+    console.log('[vercel-adapter] Building .vercel/output/ …')
 
     const outDir = path.join(projectDir, '.vercel', 'output')
     fs.rmSync(outDir, { recursive: true, force: true })
     fs.mkdirSync(outDir, { recursive: true })
 
     // ── 1. Static assets ────────────────────────────────────────────────────
-    copyDir(path.join(distDir, 'static'),   path.join(outDir, 'static', '_next', 'static'))
+    copyDir(path.join(distDir, 'static'),    path.join(outDir, 'static', '_next', 'static'))
     copyDir(path.join(projectDir, 'public'), path.join(outDir, 'static'))
 
-    // ── 2. Per-route serverless functions ────────────────────────────────────
-    const routes = []   // entries for config.json
-    const functionsDir = path.join(outDir, 'functions')
+    // ── 2. Single catch-all function ─────────────────────────────────────────
+    const funcDir = path.join(outDir, 'functions', 'index.func')
+    fs.mkdirSync(funcDir, { recursive: true })
 
-    const vcConfig = JSON.stringify(
-      { runtime: 'nodejs20.x', handler: 'index.js', launcherType: 'Nodejs', shouldAddHelpers: true },
-      null, 2
-    )
+    // Collect files – union of all output NTF traces (Map deduplicates)
+    const fileMap = new Map()
+
+    // Minimal server runtime
+    readNtf(path.join(distDir, 'next-minimal-server.js.nft.json'), projectDir, fileMap)
 
     const allOutputs = [
-      ...(outputs.appPages  || []),
-      ...(outputs.appRoutes || []),
-      ...(outputs.pages     || []),
-      ...(outputs.pagesApi  || []),
+      ...(outputs.appPages   || []),
+      ...(outputs.appRoutes  || []),
+      ...(outputs.pages      || []),
+      ...(outputs.pagesApi   || []),
+      ...(outputs.middleware ? [outputs.middleware] : []),
     ]
+
+    // Route table embedded into the handler (no NextNodeServer needed)
+    const routeEntries = []
 
     for (const out of allOutputs) {
       if (!out.filePath) continue
 
-      const { name, src } = pathnameToFunc(out.pathname)
-      const funcDir = path.join(functionsDir, name + '.func')
+      // NTF for this output (Turbopack chunks + app-specific deps)
+      readNtf(out.filePath + '.nft.json', projectDir, fileMap)
 
-      // ── 2a. Collect files via NTF (deduplicated) ─────────────────────────
-      // Start with the minimal server runtime (small, ~80 files)
-      const fileMap = readNtf(
-        path.join(distDir, 'next-minimal-server.js.nft.json'),
-        projectDir
-      )
-      // Add this output's own NTF (Turbopack chunks + app-specific deps)
-      for (const [k, v] of readNtf(out.filePath + '.nft.json', projectDir)) {
-        fileMap.set(k, v)
-      }
-      // Add assets the adapter resolved for this output
+      // Pre-resolved assets from adapter
       for (const [rel, abs] of Object.entries(out.assets || {})) {
         if (fs.existsSync(abs)) fileMap.set(rel, abs)
       }
-      // The output file itself
+
+      // The compiled handler file itself
       const relFile = path.relative(projectDir, out.filePath)
       fileMap.set(relFile, out.filePath)
 
-      // ── 2b. Essential .next/ manifests ───────────────────────────────────
-      for (const f of [
-        'required-server-files.json', 'routes-manifest.json',
-        'app-path-routes-manifest.json', 'build-manifest.json',
-        'prerender-manifest.json', 'fallback-build-manifest.json',
-        'images-manifest.json', 'package.json', 'BUILD_ID',
-      ]) {
-        const abs = path.join(distDir, f)
-        if (fs.existsSync(abs)) fileMap.set(path.join('.next', f), abs)
+      // Only app pages / routes get routes (skip middleware)
+      if (out.type !== 'MIDDLEWARE') {
+        routeEntries.push({
+          regex: pathnameToRegex(out.pathname),
+          file:  './' + relFile.replace(/\\/g, '/'),
+          pathname: out.pathname,
+        })
       }
-      // .next/server/ top-level manifests
-      const srvDir = path.join(distDir, 'server')
-      if (fs.existsSync(srvDir)) {
-        for (const e of fs.readdirSync(srvDir, { withFileTypes: true })) {
-          if (!e.isFile()) continue
-          if (!e.name.endsWith('.json') && !e.name.endsWith('.js')) continue
-          const abs = path.join(srvDir, e.name)
-          fileMap.set(path.join('.next', 'server', e.name), abs)
+    }
+
+    // Essential .next/ manifests
+    for (const f of [
+      'required-server-files.json', 'routes-manifest.json',
+      'app-path-routes-manifest.json', 'build-manifest.json',
+      'prerender-manifest.json', 'fallback-build-manifest.json',
+      'images-manifest.json', 'package.json', 'BUILD_ID',
+    ]) {
+      const abs = path.join(distDir, f)
+      if (fs.existsSync(abs)) fileMap.set(path.join('.next', f), abs)
+    }
+
+    // .next/server/ top-level files
+    const srvDir = path.join(distDir, 'server')
+    if (fs.existsSync(srvDir)) {
+      for (const e of fs.readdirSync(srvDir, { withFileTypes: true })) {
+        if (!e.isFile()) continue
+        if (!e.name.endsWith('.json') && !e.name.endsWith('.js')) continue
+        fileMap.set(path.join('.next', 'server', e.name), path.join(srvDir, e.name))
+      }
+    }
+
+    // project package.json
+    const pkgAbs = path.join(projectDir, 'package.json')
+    if (fs.existsSync(pkgAbs)) fileMap.set('package.json', pkgAbs)
+
+    // Copy everything
+    let copied = 0
+    for (const [rel, abs] of fileMap) {
+      try { copyFile(abs, path.join(funcDir, rel)); copied++ } catch { /* ignore */ }
+    }
+    console.log(`[vercel-adapter] Copied ${copied} files into index.func`)
+
+    // ── 3. Handler with embedded routing ─────────────────────────────────────
+    const routesJson = JSON.stringify(
+      routeEntries.map(r => ({ regex: r.regex, file: r.file, pathname: r.pathname })),
+      null, 2
+    )
+
+    fs.writeFileSync(path.join(funcDir, 'index.js'), `'use strict'
+process.env.NODE_ENV = 'production'
+process.chdir(__dirname)
+
+// Boot Next.js node environment
+try { require('next/dist/server/node-environment-baseline.js') } catch (e) { console.warn('env-baseline:', e.message) }
+try { require('next/dist/server/require-hook.js') }             catch (e) { console.warn('require-hook:', e.message) }
+try { require('next/dist/build/adapter/setup-node-env.external.js') } catch (e) { console.warn('setup-node-env:', e.message) }
+
+const ROUTES = ${routesJson}
+
+const cache = {}
+async function getHandler(file) {
+  if (!cache[file]) {
+    const mod = require(file)
+    cache[file] = mod.handler || mod.default || mod
+  }
+  return cache[file]
+}
+
+module.exports = async function handler(req, res) {
+  const raw     = req.url || '/'
+  const pathname = raw.split('?')[0] || '/'
+
+  for (const route of ROUTES) {
+    if (new RegExp(route.regex).test(pathname)) {
+      try {
+        const fn = await getHandler(route.file)
+        return await fn(req, res, { requestMeta: { relativeProjectDir: '.' } })
+      } catch (err) {
+        console.error('[handler]', route.pathname, err)
+        if (!res.headersSent) {
+          res.statusCode = 500
+          res.end('Internal Server Error')
         }
+        return
       }
-      // project package.json
-      const pkgAbs = path.join(projectDir, 'package.json')
-      if (fs.existsSync(pkgAbs)) fileMap.set('package.json', pkgAbs)
+    }
+  }
 
-      // ── 2c. Copy to function dir ─────────────────────────────────────────
-      fs.mkdirSync(funcDir, { recursive: true })
-      let n = 0
-      for (const [rel, abs] of fileMap) {
-        try { copyFile(abs, path.join(funcDir, rel)); n++ } catch { /* ignore */ }
-      }
-      console.log(`[vercel-adapter]  ${name} → ${n} files`)
-
-      // ── 2d. Handler (invokes the compiled route handler directly) ─────────
-      // Next.js 16 per-route handlers export:
-      //   handler(req: IncomingMessage, res: ServerResponse, ctx) => Promise<void>
-      const handlerImport = './' + relFile.replace(/\\/g, '/')
-      fs.writeFileSync(path.join(funcDir, 'index.js'), `'use strict'
-process.env.NODE_ENV = 'production'
-process.chdir(__dirname)
-
-// Set up Next.js node env extensions
-try { require('next/dist/server/node-environment-baseline.js') } catch {}
-try { require('next/dist/server/require-hook.js') } catch {}
-
-const mod = require(${JSON.stringify(handlerImport)})
-// The module may export { handler } or export the handler directly
-const fn = mod.handler || mod.default || mod
-
-module.exports = async function(req, res) {
-  await fn(req, res, { requestMeta: { relativeProjectDir: '.' } })
+  res.statusCode = 404
+  res.end('Not found')
 }
 `)
 
-      fs.writeFileSync(path.join(funcDir, '.vc-config.json'), vcConfig)
-
-      // ── 2e. Add route ─────────────────────────────────────────────────────
-      routes.push({ src, dest: `/${name}` })
-    }
-
-    // ── 3. Middleware function ────────────────────────────────────────────────
-    if (outputs.middleware) {
-      const mid = outputs.middleware
-      const midDir = path.join(functionsDir, 'middleware.func')
-      fs.mkdirSync(midDir, { recursive: true })
-
-      const midMap = readNtf(mid.filePath + '.nft.json', projectDir)
-      for (const [k, v] of readNtf(path.join(distDir, 'next-minimal-server.js.nft.json'), projectDir)) {
-        midMap.set(k, v)
-      }
-      for (const [rel, abs] of Object.entries(mid.assets || {})) {
-        if (fs.existsSync(abs)) midMap.set(rel, abs)
-      }
-      const relMid = path.relative(projectDir, mid.filePath)
-      midMap.set(relMid, mid.filePath)
-
-      for (const [rel, abs] of midMap) {
-        try { copyFile(abs, path.join(midDir, rel)) } catch {}
-      }
-
-      const midImport = './' + relMid.replace(/\\/g, '/')
-      fs.writeFileSync(path.join(midDir, 'index.js'), `'use strict'
-process.env.NODE_ENV = 'production'
-process.chdir(__dirname)
-try { require('next/dist/server/node-environment-baseline.js') } catch {}
-try { require('next/dist/server/require-hook.js') } catch {}
-const mod = require(${JSON.stringify(midImport)})
-const fn = mod.handler || mod.default || mod
-module.exports = async function(req, res) {
-  await fn(req, res, { requestMeta: { relativeProjectDir: '.' } })
-}
-`)
-      fs.writeFileSync(path.join(midDir, '.vc-config.json'), vcConfig)
-    }
+    fs.writeFileSync(
+      path.join(funcDir, '.vc-config.json'),
+      JSON.stringify({ runtime: 'nodejs20.x', handler: 'index.js', launcherType: 'Nodejs', shouldAddHelpers: true }, null, 2)
+    )
 
     // ── 4. Vercel routing config ──────────────────────────────────────────────
     fs.writeFileSync(
@@ -225,20 +201,16 @@ module.exports = async function(req, res) {
       JSON.stringify({
         version: 3,
         routes: [
-          // Immutable static chunks
           { src: '^/_next/static/(.+)$', headers: { 'cache-control': 'public, max-age=31536000, immutable' }, continue: true },
-          // Serve public/ files from filesystem first
           { handle: 'filesystem' },
-          // Per-route functions (most specific first)
-          ...routes.sort((a, b) => b.src.length - a.src.length),
-          // Fallback 404
           { src: '^/(.*)$', dest: '/index' },
         ],
       }, null, 2)
     )
 
-    console.log(`[vercel-adapter] ✓ ${routes.length} routes, .vercel/output/ ready`)
+    console.log(`[vercel-adapter] ✓ 1 function, ${routeEntries.length} routes`)
   },
 }
 
 module.exports = adapter
+`)
