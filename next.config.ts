@@ -1,9 +1,6 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  experimental: {
-    adapterPath: require.resolve('@next-community/adapter-vercel'),
-  },
   images: {
     remotePatterns: [
       {
