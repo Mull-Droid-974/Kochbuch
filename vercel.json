@@ -4,16 +4,5 @@
       "path": "/api/daily-menus/cron",
       "schedule": "0 5 * * *"
     }
-  ],
-  "functions": {
-    "app/api/recipes/generate/route.ts": {
-      "maxDuration": 30
-    },
-    "app/api/search/route.ts": {
-      "maxDuration": 30
-    },
-    "app/api/daily-menus/cron/route.ts": {
-      "maxDuration": 60
-    }
-  }
+  ]
 }
