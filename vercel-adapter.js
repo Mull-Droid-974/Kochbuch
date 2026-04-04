@@ -1,30 +1,26 @@
 // Minimal Vercel deployment adapter for Next.js 16
 // Generates .vercel/output/ using the Vercel Build Output API v3
+// Uses NTF trace files (.nft.json) to bundle only required dependencies
 
 'use strict'
 const fs = require('fs')
 const path = require('path')
 
+function copyFile(src, dest) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true })
+  fs.copyFileSync(src, dest)
+}
+
 function copyDir(src, dest) {
+  if (!fs.existsSync(src)) return
   fs.mkdirSync(dest, { recursive: true })
-  let entries
-  try {
-    entries = fs.readdirSync(src, { withFileTypes: true })
-  } catch {
-    return
-  }
-  for (const entry of entries) {
-    const srcPath = path.join(src, entry.name)
-    const destPath = path.join(dest, entry.name)
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, entry.name)
+    const d = path.join(dest, entry.name)
     if (entry.isDirectory()) {
-      copyDir(srcPath, destPath)
+      copyDir(s, d)
     } else {
-      try {
-        fs.mkdirSync(path.dirname(destPath), { recursive: true })
-        fs.copyFileSync(srcPath, destPath)
-      } catch {
-        // ignore individual file errors
-      }
+      try { copyFile(s, d) } catch { /* ignore */ }
     }
   }
 }
@@ -40,60 +36,64 @@ const adapter = {
     fs.rmSync(outputDir, { recursive: true, force: true })
     fs.mkdirSync(outputDir, { recursive: true })
 
-    // ── 1. Static assets ─────────────────────────────────────────────────────
-    // .next/static → .vercel/output/static/_next/static  (immutable chunks)
-    const nextStaticSrc = path.join(distDir, 'static')
-    if (fs.existsSync(nextStaticSrc)) {
-      copyDir(nextStaticSrc, path.join(outputDir, 'static', '_next', 'static'))
-    }
-
-    // public/ → .vercel/output/static/  (favicon, images, etc.)
-    const publicSrc = path.join(projectDir, 'public')
-    if (fs.existsSync(publicSrc)) {
-      copyDir(publicSrc, path.join(outputDir, 'static'))
-    }
+    // ── 1. Static assets ──────────────────────────────────────────────────────
+    // .next/static → .vercel/output/static/_next/static
+    copyDir(path.join(distDir, 'static'), path.join(outputDir, 'static', '_next', 'static'))
+    // public/ → .vercel/output/static/
+    copyDir(path.join(projectDir, 'public'), path.join(outputDir, 'static'))
 
     // ── 2. Serverless function ────────────────────────────────────────────────
-    const standaloneDir = path.join(distDir, 'standalone')
-    if (!fs.existsSync(standaloneDir)) {
-      throw new Error(
-        '[vercel-adapter] .next/standalone not found – did "output: standalone" take effect?'
-      )
-    }
-
     const funcDir = path.join(outputDir, 'functions', 'index.func')
     fs.mkdirSync(funcDir, { recursive: true })
 
-    // Copy standalone contents into the function directory.
-    // Skip .next/static (already served as static asset above).
-    for (const entry of fs.readdirSync(standaloneDir, { withFileTypes: true })) {
-      const src = path.join(standaloneDir, entry.name)
-      const dest = path.join(funcDir, entry.name)
-
+    // 2a. Copy .next build output (server-side) into funcDir/.next/
+    //     Skip: cache (huge), static (already served above)
+    const nextDest = path.join(funcDir, '.next')
+    fs.mkdirSync(nextDest, { recursive: true })
+    for (const entry of fs.readdirSync(distDir, { withFileTypes: true })) {
+      if (entry.name === 'cache' || entry.name === 'static') continue
+      const src = path.join(distDir, entry.name)
+      const dest = path.join(nextDest, entry.name)
       if (entry.isDirectory()) {
-        if (entry.name === '.next') {
-          // Copy .next but omit the static subfolder to avoid duplication
-          fs.mkdirSync(dest, { recursive: true })
-          for (const sub of fs.readdirSync(src, { withFileTypes: true })) {
-            if (sub.name === 'static') continue
-            const subSrc = path.join(src, sub.name)
-            const subDest = path.join(dest, sub.name)
-            if (sub.isDirectory()) {
-              copyDir(subSrc, subDest)
-            } else {
-              fs.mkdirSync(path.dirname(subDest), { recursive: true })
-              fs.copyFileSync(subSrc, subDest)
-            }
-          }
-        } else {
-          copyDir(src, dest)
-        }
+        copyDir(src, dest)
       } else {
-        fs.copyFileSync(src, dest)
+        try { copyFile(src, dest) } catch { /* ignore */ }
       }
     }
 
-    // Write the request handler that Vercel invokes for every HTTP request
+    // 2b. Copy traced dependencies via next-server.js.nft.json
+    //     This is the minimal set of files needed to run the Next.js server.
+    const nftPath = path.join(distDir, 'next-server.js.nft.json')
+    if (fs.existsSync(nftPath)) {
+      const { files } = JSON.parse(fs.readFileSync(nftPath, 'utf8'))
+      const nftDir = path.dirname(nftPath) // = distDir
+
+      let copied = 0
+      for (const relFile of files) {
+        const absFile = path.resolve(nftDir, relFile)
+        const relToProject = path.relative(projectDir, absFile)
+        if (relToProject.startsWith('..')) continue // outside project root
+        const dest = path.join(funcDir, relToProject)
+        if (fs.existsSync(absFile)) {
+          try {
+            copyFile(absFile, dest)
+            copied++
+          } catch { /* ignore */ }
+        }
+      }
+      console.log(`[vercel-adapter] Copied ${copied} traced dependencies`)
+    } else {
+      console.warn('[vercel-adapter] WARNING: next-server.js.nft.json not found, copying full node_modules')
+      copyDir(path.join(projectDir, 'node_modules'), path.join(funcDir, 'node_modules'))
+    }
+
+    // 2c. Copy package.json (Next.js server needs it)
+    const pkgSrc = path.join(projectDir, 'package.json')
+    if (fs.existsSync(pkgSrc)) {
+      copyFile(pkgSrc, path.join(funcDir, 'package.json'))
+    }
+
+    // 2d. Write the request handler
     fs.writeFileSync(
       path.join(funcDir, 'index.js'),
       `'use strict'
@@ -118,46 +118,32 @@ module.exports = async function handler(req, res) {
 `
     )
 
-    // Vercel function metadata
+    // 2e. Write Vercel function metadata
     fs.writeFileSync(
       path.join(funcDir, '.vc-config.json'),
       JSON.stringify(
-        {
-          runtime: 'nodejs20.x',
-          handler: 'index.js',
-          launcherType: 'Nodejs',
-          shouldAddHelpers: true,
-        },
-        null,
-        2
+        { runtime: 'nodejs20.x', handler: 'index.js', launcherType: 'Nodejs', shouldAddHelpers: true },
+        null, 2
       )
     )
 
-    // ── 3. Routing config ─────────────────────────────────────────────────────
+    // ── 3. Vercel routing config ──────────────────────────────────────────────
     fs.writeFileSync(
       path.join(outputDir, 'config.json'),
       JSON.stringify(
         {
           version: 3,
           routes: [
-            // Immutable hashed assets
-            {
-              src: '^/_next/static/(.+)$',
-              headers: { 'cache-control': 'public, max-age=31536000, immutable' },
-              continue: true,
-            },
-            // Serve files from /static/ before hitting the function
+            { src: '^/_next/static/(.+)$', headers: { 'cache-control': 'public, max-age=31536000, immutable' }, continue: true },
             { handle: 'filesystem' },
-            // Everything else → Next.js handler
             { src: '^/(.*)$', dest: '/index' },
           ],
         },
-        null,
-        2
+        null, 2
       )
     )
 
-    console.log('[vercel-adapter] ✓ .vercel/output/ created successfully')
+    console.log('[vercel-adapter] ✓ .vercel/output/ created')
   },
 }
 
