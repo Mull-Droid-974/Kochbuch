@@ -33,11 +33,6 @@ function copyDir(src, dest) {
 const adapter = {
   name: 'vercel-standalone',
 
-  // Enable standalone output so Next.js bundles all dependencies
-  modifyConfig(config) {
-    return { ...config, output: 'standalone' }
-  },
-
   async onBuildComplete({ distDir, projectDir }) {
     console.log('[vercel-adapter] Building Vercel output...')
 

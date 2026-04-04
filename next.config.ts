@@ -3,6 +3,7 @@ import type { NextConfig } from "next";
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const nextConfig: NextConfig = {
   adapterPath: require.resolve('./vercel-adapter.js'),
+  output: 'standalone',
   images: {
     remotePatterns: [
       {
