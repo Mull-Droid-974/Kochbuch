@@ -25,26 +25,36 @@ export async function proxy(request: NextRequest) {
     }
   )
 
-  const { data: { user } } = await supabase.auth.getUser()
-
   const { pathname } = request.nextUrl
 
   // Public paths that don't need auth
   const publicPaths = ['/login', '/api/auth']
   const isPublic = publicPaths.some(p => pathname.startsWith(p))
+  const isCron = pathname.startsWith('/api/daily-menus/cron')
 
-  // Protect all app routes
-  if (!user && !isPublic && !pathname.startsWith('/api/daily-menus/cron')) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/login'
-    return NextResponse.redirect(url)
-  }
+  try {
+    const { data: { user } } = await supabase.auth.getUser()
 
-  // Redirect logged-in users away from login page
-  if (user && pathname === '/login') {
-    const url = request.nextUrl.clone()
-    url.pathname = '/daily'
-    return NextResponse.redirect(url)
+    // Protect all app routes
+    if (!user && !isPublic && !isCron) {
+      const url = request.nextUrl.clone()
+      url.pathname = '/login'
+      return NextResponse.redirect(url)
+    }
+
+    // Redirect logged-in users away from login page
+    if (user && pathname === '/login') {
+      const url = request.nextUrl.clone()
+      url.pathname = '/daily'
+      return NextResponse.redirect(url)
+    }
+  } catch {
+    // If Supabase is unreachable, redirect to login for protected routes
+    if (!isPublic && !isCron) {
+      const url = request.nextUrl.clone()
+      url.pathname = '/login'
+      return NextResponse.redirect(url)
+    }
   }
 
   return supabaseResponse
