@@ -1,7 +1,16 @@
 import { SupabaseClient } from '@supabase/supabase-js'
-import { searchSpoonacularRecipe } from './spoonacular'
+import { generateRecipe } from './ai/recipe-generator'
+import { Season } from '@/types/database'
 
 const SLOTS = ['lunch', 'dinner_1', 'dinner_2'] as const
+
+function getCurrentSeason(): Season {
+  const month = new Date().getMonth() + 1
+  if (month >= 3 && month <= 5) return 'spring'
+  if (month >= 6 && month <= 8) return 'summer'
+  if (month >= 9 && month <= 11) return 'autumn'
+  return 'winter'
+}
 
 export async function generateDailyMenus(supabase: SupabaseClient, date: string) {
   // Get existing recipe titles to avoid repeats
@@ -12,17 +21,21 @@ export async function generateDailyMenus(supabase: SupabaseClient, date: string)
     .limit(30)
 
   const mealConfigs: Array<{ mealType: 'lunch' | 'dinner'; slot: typeof SLOTS[number] }> = [
-    { mealType: 'lunch', slot: 'lunch' },
+    { mealType: 'lunch',  slot: 'lunch' },
     { mealType: 'dinner', slot: 'dinner_1' },
     { mealType: 'dinner', slot: 'dinner_2' },
   ]
 
+  const season = getCurrentSeason()
   const savedRecipes = []
   const usedTitles = recentRecipes?.map(r => r.title) ?? []
 
   for (const config of mealConfigs) {
-    const recipe = await searchSpoonacularRecipe(config.mealType, usedTitles)
-    if (!recipe) throw new Error(`Could not fetch recipe for ${config.mealType}`)
+    const recipe = await generateRecipe({
+      mealType: config.mealType,
+      season,
+      avoidTitles: usedTitles,
+    })
 
     usedTitles.push(recipe.title)
 
