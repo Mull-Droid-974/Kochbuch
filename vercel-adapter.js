@@ -154,6 +154,10 @@ try { require('next/dist/server/node-environment-baseline.js') } catch (e) { con
 try { require('next/dist/server/require-hook.js') }             catch (e) { console.warn('require-hook:', e.message) }
 try { require('next/dist/build/adapter/setup-node-env.external.js') } catch (e) { console.warn('setup-node-env:', e.message) }
 
+// Expose request context so lib/supabase/server.ts can read cookies
+const { AsyncLocalStorage } = require('async_hooks')
+if (!global.__adapterStorage) global.__adapterStorage = new AsyncLocalStorage()
+
 const ROUTES = ${routesJson}
 
 const cache = {}
@@ -166,22 +170,23 @@ async function getHandler(file) {
 }
 
 module.exports = async function handler(req, res) {
-  const raw     = req.url || '/'
+  const raw      = req.url || '/'
   const pathname = raw.split('?')[0] || '/'
 
   for (const route of ROUTES) {
     if (new RegExp(route.regex).test(pathname)) {
-      try {
-        const fn = await getHandler(route.file)
-        return await fn(req, res, { requestMeta: { relativeProjectDir: '.' } })
-      } catch (err) {
-        console.error('[handler]', route.pathname, err)
-        if (!res.headersSent) {
-          res.statusCode = 500
-          res.end('Internal Server Error')
+      return global.__adapterStorage.run({ req, res }, async () => {
+        try {
+          const fn = await getHandler(route.file)
+          return await fn(req, res, { requestMeta: { relativeProjectDir: '.' } })
+        } catch (err) {
+          console.error('[handler]', route.pathname, err)
+          if (!res.headersSent) {
+            res.statusCode = 500
+            res.end('Internal Server Error')
+          }
         }
-        return
-      }
+      })
     }
   }
 
