@@ -4,6 +4,7 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   adapterPath: require.resolve('./vercel-adapter.js'),
   images: {
+    unoptimized: true,
     remotePatterns: [
       {
         protocol: 'https',
